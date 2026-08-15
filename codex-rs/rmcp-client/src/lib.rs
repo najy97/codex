@@ -17,6 +17,7 @@ mod protocol_mode;
 mod rmcp_client;
 mod startup_error;
 mod stdio_server_launcher;
+mod stdio_server_process;
 mod utils;
 
 pub use auth_status::McpAuthState;

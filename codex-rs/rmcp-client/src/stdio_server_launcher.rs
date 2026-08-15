@@ -15,20 +15,10 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::future::Future;
 use std::io;
-#[cfg(windows)]
-use std::os::windows::io::OwnedHandle;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
-#[cfg(unix)]
-use std::thread::sleep;
-#[cfg(unix)]
-use std::thread::spawn;
-#[cfg(unix)]
-use std::time::Duration;
 
 use anyhow::Result;
 use anyhow::anyhow;
@@ -36,18 +26,9 @@ use codex_config::types::McpServerEnvVar;
 use codex_exec_server::ExecBackend;
 use codex_exec_server::ExecEnvPolicy;
 use codex_exec_server::ExecParams;
-use codex_exec_server::ExecProcess;
 use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
-#[cfg(all(unix, not(target_os = "macos")))]
-use codex_utils_pty::process_group::kill_process_group;
-#[cfg(target_os = "macos")]
-use codex_utils_pty::process_group::kill_process_group_with_member_fallback as kill_process_group;
-#[cfg(all(unix, not(target_os = "macos")))]
-use codex_utils_pty::process_group::terminate_process_group;
-#[cfg(target_os = "macos")]
-use codex_utils_pty::process_group::terminate_process_group_with_member_fallback as terminate_process_group;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use rmcp::service::RoleClient;
@@ -65,6 +46,8 @@ use crate::executor_process_transport::ExecutorProcessTransport;
 use crate::local_stdio_transport::LocalStdioTransport;
 use crate::program_resolver;
 use crate::protocol_mode::McpProtocolMode;
+use crate::stdio_server_process::LocalProcessTerminator;
+use crate::stdio_server_process::StdioServerProcessHandle;
 use crate::utils::create_env_for_mcp_server;
 use crate::utils::create_env_overlay_for_remote_mcp_server;
 use crate::utils::remote_mcp_env_var_names;
@@ -219,39 +202,6 @@ impl StdioServerLauncher for LocalStdioServerLauncher {
 
 // Local private implementation.
 
-#[cfg(unix)]
-const PROCESS_GROUP_TERM_GRACE_PERIOD: Duration = Duration::from_secs(2);
-
-#[cfg(unix)]
-struct LocalProcessTerminator {
-    process_group_id: u32,
-}
-
-#[cfg(windows)]
-enum LocalProcessTerminator {
-    Job(codex_utils_pty::JobObject),
-    Process(OwnedHandle),
-}
-
-#[cfg(not(any(unix, windows)))]
-struct LocalProcessTerminator;
-
-#[derive(Clone)]
-pub(crate) struct StdioServerProcessHandle {
-    inner: Arc<StdioServerProcessHandleInner>,
-}
-
-struct StdioServerProcessHandleInner {
-    program_name: String,
-    kind: StdioServerProcessKind,
-    terminated: AtomicBool,
-}
-
-enum StdioServerProcessKind {
-    Local(Option<LocalProcessTerminator>),
-    Executor(Arc<dyn ExecProcess>),
-}
-
 mod private {
     pub trait Sealed {}
 }
@@ -397,134 +347,6 @@ impl LocalStdioServerLauncher {
             inner: transport,
             process,
         })
-    }
-}
-
-impl LocalProcessTerminator {
-    #[cfg(not(windows))]
-    fn new(process_group_id: u32) -> Self {
-        #[cfg(unix)]
-        {
-            Self { process_group_id }
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = process_group_id;
-            Self
-        }
-    }
-
-    #[cfg(unix)]
-    fn terminate(&self) {
-        let process_group_id = self.process_group_id;
-        let should_escalate = match terminate_process_group(process_group_id) {
-            Ok(exists) => exists,
-            Err(error) => {
-                warn!("Failed to terminate MCP process group {process_group_id}: {error}");
-                false
-            }
-        };
-        if should_escalate {
-            spawn(move || {
-                sleep(PROCESS_GROUP_TERM_GRACE_PERIOD);
-                if let Err(error) = kill_process_group(process_group_id) {
-                    warn!("Failed to kill MCP process group {process_group_id}: {error}");
-                }
-            });
-        }
-    }
-
-    #[cfg(windows)]
-    fn terminate(&self) {
-        let result = match self {
-            Self::Job(job) => job.terminate(),
-            Self::Process(process_handle) => {
-                codex_utils_pty::JobObject::terminate_process_handle(process_handle)
-            }
-        };
-        if let Err(error) = result {
-            warn!("Failed to terminate Windows MCP process: {error}");
-        }
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    fn terminate(&self) {}
-}
-
-impl StdioServerProcessHandle {
-    fn local(program_name: String, terminator: Option<LocalProcessTerminator>) -> Self {
-        Self {
-            inner: Arc::new(StdioServerProcessHandleInner {
-                program_name,
-                kind: StdioServerProcessKind::Local(terminator),
-                terminated: AtomicBool::new(false),
-            }),
-        }
-    }
-
-    pub(crate) fn executor(program_name: String, process: Arc<dyn ExecProcess>) -> Self {
-        Self {
-            inner: Arc::new(StdioServerProcessHandleInner {
-                program_name,
-                kind: StdioServerProcessKind::Executor(process),
-                terminated: AtomicBool::new(false),
-            }),
-        }
-    }
-
-    pub(crate) async fn terminate(&self) -> io::Result<()> {
-        if self.inner.terminated.swap(true, Ordering::AcqRel) {
-            return Ok(());
-        }
-
-        match &self.inner.kind {
-            StdioServerProcessKind::Local(Some(terminator)) => {
-                terminator.terminate();
-                Ok(())
-            }
-            StdioServerProcessKind::Local(None) => Ok(()),
-            StdioServerProcessKind::Executor(process) => match process.terminate().await {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    self.inner.terminated.store(false, Ordering::Release);
-                    Err(io::Error::other(error))
-                }
-            },
-        }
-    }
-}
-
-impl Drop for StdioServerProcessHandleInner {
-    fn drop(&mut self) {
-        if self.terminated.swap(true, Ordering::AcqRel) {
-            return;
-        }
-
-        match &self.kind {
-            StdioServerProcessKind::Local(Some(terminator)) => {
-                terminator.terminate();
-            }
-            StdioServerProcessKind::Local(None) => {}
-            StdioServerProcessKind::Executor(process) => {
-                let process = Arc::clone(process);
-                let program_name = self.program_name.clone();
-                let Ok(handle) = tokio::runtime::Handle::try_current() else {
-                    warn!(
-                        "Could not schedule remote MCP server process termination on drop ({}): no Tokio runtime is available",
-                        self.program_name
-                    );
-                    return;
-                };
-
-                std::mem::drop(handle.spawn(async move {
-                    if let Err(error) = process.terminate().await {
-                        warn!(
-                            "Failed to terminate remote MCP server process on drop ({program_name}): {error}"
-                        );
-                    }
-                }));
-            }
-        }
     }
 }
 

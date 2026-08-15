@@ -2874,6 +2874,33 @@ async fn shutdown_cancels_pending_tool_listing() {
 }
 
 #[tokio::test]
+async fn shutdown_cancels_dormant_lazy_startup_without_polling_it() {
+    let cancel_token = CancellationToken::new();
+    let (startup_trigger, _startup_requested) = watch::channel(false);
+    let connection = McpServerConnection {
+        identity: None,
+        client: AsyncManagedClient {
+            client: futures::future::pending().boxed().shared(),
+            is_codex_apps_mcp_server: false,
+            cached_server_info: None,
+            codex_apps_tools_cache_context: None,
+            tool_catalog_cache_context: None,
+            startup_complete: Arc::new(AtomicBool::new(false)),
+            startup_reconnect: None,
+            cancel_token: cancel_token.clone(),
+        },
+        startup_trigger: Some(startup_trigger),
+        _diagnostics_guard: LIVE_CONNECTIONS.track(),
+    };
+
+    tokio::time::timeout(Duration::from_millis(50), connection.shutdown())
+        .await
+        .expect("dormant startup must not be polled by shutdown");
+
+    assert!(cancel_token.is_cancelled());
+}
+
+#[tokio::test]
 async fn shutdown_continues_after_caller_is_aborted() {
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
@@ -4274,7 +4301,7 @@ async fn reconciliation_reuses_an_unchanged_ready_server() {
 }
 
 #[tokio::test]
-async fn reconciliation_reuses_an_unchanged_pending_server_without_waiting() -> anyhow::Result<()> {
+async fn reconciliation_reuses_one_pending_server_across_twenty_refreshes() -> anyhow::Result<()> {
     let runtime_context = reusable_server_runtime_context();
     let mut config = reusable_server_config("http://127.0.0.1:1");
     let tools = vec![
@@ -4302,14 +4329,20 @@ async fn reconciliation_reuses_an_unchanged_pending_server_without_waiting() -> 
     connection.client = pending_client;
     config.enabled_tools = Some(vec!["search".to_string()]);
 
-    let reconciled = tokio::time::timeout(
-        Duration::from_millis(100),
-        reconcile_reusable_server(&previous, config, runtime_context),
-    )
-    .await
-    .expect("reconciliation must not wait for an unchanged pending MCP server");
-
-    assert!(previous.shares_test_connection_with(&reconciled, "docs"));
+    let original_connection = Arc::clone(&previous.servers["docs"].connection);
+    let mut reconciled = previous;
+    for _ in 0..20 {
+        reconciled = tokio::time::timeout(
+            Duration::from_millis(100),
+            reconcile_reusable_server(&reconciled, config.clone(), runtime_context.clone()),
+        )
+        .await
+        .expect("reconciliation must not wait for an unchanged pending MCP server");
+        assert!(Arc::ptr_eq(
+            &original_connection,
+            &reconciled.servers["docs"].connection
+        ));
+    }
     release_startup
         .send(())
         .map_err(|()| anyhow!("pending startup should still be running"))?;

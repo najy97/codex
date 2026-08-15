@@ -133,6 +133,14 @@ fn signal_process_group_id(pgid: libc::pid_t, signal: libc::c_int) -> io::Result
     Ok(true)
 }
 
+#[cfg(unix)]
+/// Return whether an exact, previously captured process group still exists.
+///
+/// This sends signal 0 to the group and does not enumerate system processes.
+pub fn process_group_exists(process_group_id: u32) -> io::Result<bool> {
+    signal_process_group_id(process_group_id as libc::pid_t, /*signal*/ 0)
+}
+
 #[cfg(target_os = "macos")]
 fn signal_process_id(pid: libc::pid_t, signal: libc::c_int) -> io::Result<bool> {
     if unsafe { libc::kill(pid, signal) } == -1 {
@@ -220,6 +228,18 @@ fn signal_process_group_with_member_fallback(
     } else {
         first_error.map_or(Ok(false), Err)
     }
+}
+
+#[cfg(target_os = "macos")]
+/// Check an exact process group, enumerating only that group's members when
+/// macOS rejects a group-wide signal-0 probe with `EPERM`.
+pub fn process_group_exists_with_member_fallback(process_group_id: u32) -> io::Result<bool> {
+    signal_process_group_with_member_fallback(
+        process_group_id,
+        /*signal*/ 0,
+        signal_process_group_id,
+        signal_process_id,
+    )
 }
 
 #[cfg(unix)]

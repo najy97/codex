@@ -128,7 +128,11 @@ impl McpServerConnection {
         self.client.client().await
     }
 
-    async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) {
+        if self.startup_is_dormant() {
+            self.client.cancel_token.cancel();
+            return;
+        }
         self.client.shutdown().await;
     }
 
@@ -190,7 +194,55 @@ pub(crate) struct McpConnectionSet {
     elicitation_requests: ElicitationRequestManager,
 }
 
+/// Connections removed from a publication and no longer shared by its
+/// successor.
+///
+/// Each entry holds the retirement task's owner reference. Captured bindings
+/// hold additional strong references that act as in-flight leases.
+pub(crate) struct McpConnectionRetirement {
+    pub(crate) connections: Vec<Arc<McpServerConnection>>,
+}
+
+impl McpConnectionRetirement {
+    /// Waits for captured bindings to release each retired connection, then
+    /// shuts all eligible connections down concurrently.
+    pub(crate) async fn shutdown_when_unleased(self) {
+        futures::future::join_all(self.connections.into_iter().map(|connection| async move {
+            // This future owns one strong reference. Because the connection is
+            // absent from the successor publication, any additional strong
+            // references are binding leases that must finish before shutdown.
+            // Final thread shutdown may upgrade a tracked Weak concurrently,
+            // which is safe because process cleanup is shared and idempotent.
+            while Arc::strong_count(&connection) > 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            connection.shutdown().await;
+        }))
+        .await;
+    }
+}
+
 impl McpConnectionSet {
+    /// Selects connections that the successor did not reuse and therefore must
+    /// be retired after their outstanding binding leases drain.
+    pub(crate) fn retirement_replaced_by(
+        previous: &Self,
+        successor: &Self,
+    ) -> Option<McpConnectionRetirement> {
+        let mut connections = Vec::new();
+        for (server_name, previous_view) in &previous.servers {
+            let connection = &previous_view.connection;
+            let shared_with_successor = successor
+                .servers
+                .get(server_name)
+                .is_some_and(|view| Arc::ptr_eq(connection, &view.connection));
+            if !shared_with_successor {
+                connections.push(Arc::clone(connection));
+            }
+        }
+        (!connections.is_empty()).then_some(McpConnectionRetirement { connections })
+    }
+
     /// Creates an MCP connection manager. Threadless callers can pass no `tx_event`; startup
     /// notifications are then skipped and interactive elicitations are declined.
     pub async fn new(

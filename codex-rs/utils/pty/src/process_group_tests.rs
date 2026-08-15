@@ -92,3 +92,16 @@ fn denied_group_signal_rejects_unsafe_process_group_ids() {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }
+
+#[test]
+fn denied_group_probe_reports_a_group_with_no_members_as_gone() -> Result<()> {
+    let exists = signal_process_group_with_member_fallback(
+        i32::MAX as u32,
+        /*signal*/ 0,
+        |_, _| Err(io::Error::from_raw_os_error(libc::EPERM)),
+        |_, _| unreachable!("a nonexistent group has no members to probe"),
+    )?;
+
+    assert!(!exists);
+    Ok(())
+}

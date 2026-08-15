@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -40,12 +41,14 @@ use rmcp::model::ReadResourceResult;
 use rmcp::model::RequestId;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::McpConfig;
 use crate::binding::McpBinding;
 use crate::connection_manager::McpConnectionSet;
+use crate::connection_manager::McpServerConnection;
 use crate::elicitation::ElicitationLifecycle;
 use crate::elicitation::ElicitationRequestRouter;
 use crate::elicitation::ElicitationReviewerHandle;
@@ -92,6 +95,9 @@ pub struct McpRuntimeInput {
 pub struct McpRuntime {
     current: ArcSwap<PublishedMcpRuntime>,
     hosted_event_server_removals: watch::Sender<()>,
+    // Weak handles keep retired generations reachable for final thread
+    // shutdown without extending the lifetime of their binding leases.
+    retired_connections: AsyncMutex<Vec<Weak<McpServerConnection>>>,
     reconnect_pending: AtomicBool,
     elicitation_router: ElicitationRequestRouter,
     resource_origins: Mutex<ResourceOrigins>,
@@ -177,6 +183,7 @@ impl McpRuntime {
                 cached_binding: Mutex::new(None),
             }),
             hosted_event_server_removals: watch::channel(()).0,
+            retired_connections: AsyncMutex::new(Vec::new()),
             reconnect_pending: AtomicBool::new(false),
             elicitation_router: ElicitationRequestRouter::default(),
             resource_origins: Mutex::default(),
@@ -264,6 +271,10 @@ impl McpRuntime {
     }
 
     async fn publish(&self, input: McpRuntimeInput, previous: Option<&McpConnectionSet>) {
+        self.retired_connections
+            .lock()
+            .await
+            .retain(|connection| connection.strong_count() != 0);
         let (publish, publication_gate) = McpPublicationGate::pending();
         let config = Arc::clone(&input.config);
         let auth = input.auth.clone();
@@ -288,6 +299,20 @@ impl McpRuntime {
                         .source()
                         .is_host_owned_apps(CODEX_APPS_MCP_SERVER_NAME, registration.config())
                 });
+        let previous_published_connections = self.latest_connections();
+        if let Some(retirement) = McpConnectionSet::retirement_replaced_by(
+            previous_published_connections.as_ref(),
+            connections.as_ref(),
+        ) {
+            // Register weak handles before detaching retirement so final thread
+            // shutdown can join the same per-process cleanup even if the
+            // retirement task is still waiting for an in-flight binding.
+            self.retired_connections
+                .lock()
+                .await
+                .extend(retirement.connections.iter().map(Arc::downgrade));
+            std::mem::drop(tokio::spawn(retirement.shutdown_when_unleased()));
+        }
         self.current.store(Arc::new(PublishedMcpRuntime {
             connections,
             config: Some(config),
@@ -545,8 +570,31 @@ impl McpRuntime {
         ))
     }
 
+    /// Force-stops every generation owned by the thread during final shutdown.
     pub async fn shutdown(&self) {
-        self.latest_connections().shutdown().await;
+        let connections = self
+            .retired_connections
+            .lock()
+            .await
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        let current = self.latest_connections();
+
+        // The task owns the complete batch independently of its caller. If the
+        // first shutdown caller is cancelled, a later caller can still invoke
+        // shutdown again and await the same per-process cleanup completions.
+        let shutdown_task = tokio::spawn(async move {
+            let retired_shutdown = futures::future::join_all(
+                connections
+                    .into_iter()
+                    .map(|connection| async move { connection.shutdown().await }),
+            );
+            let (_, _) = tokio::join!(current.shutdown(), retired_shutdown);
+        });
+        if let Err(error) = shutdown_task.await {
+            tracing::warn!(%error, "MCP runtime shutdown task failed");
+        }
     }
 }
 

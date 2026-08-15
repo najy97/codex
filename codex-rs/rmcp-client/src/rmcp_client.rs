@@ -88,8 +88,8 @@ use crate::oauth_http_client::OAuthHttpClientAdapter;
 use crate::protocol_mode::McpProtocolMode;
 use crate::stdio_server_launcher::StdioServerCommand;
 use crate::stdio_server_launcher::StdioServerLauncher;
-use crate::stdio_server_launcher::StdioServerProcessHandle;
 use crate::stdio_server_launcher::StdioServerTransport;
+use crate::stdio_server_process::StdioServerProcessHandle;
 use crate::utils::build_default_headers;
 use codex_config::types::OAuthCredentialsStoreMode;
 

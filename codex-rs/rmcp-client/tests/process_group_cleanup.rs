@@ -178,3 +178,205 @@ async fn shutdown_kills_initialized_stdio_server_with_in_flight_operation() -> R
     let _ = tokio::time::timeout(Duration::from_secs(5), call_task).await?;
     Ok(())
 }
+
+#[test]
+fn second_shutdown_waits_for_shared_cleanup_before_runtime_exit() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let owned_pid_file = temp_dir.path().join("cancelled-shutdown.pid");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let owned_pid = runtime.block_on(async {
+        let client = Arc::new(
+            RmcpClient::new_stdio_client(
+                OsString::from("/bin/sh"),
+                vec![
+                    OsString::from("-c"),
+                    OsString::from(
+                        "trap '' TERM; echo \"$$\" > \"$OWNED_PID_FILE\"; while :; do sleep 1; done",
+                    ),
+                ],
+                Some(HashMap::from([(
+                    OsString::from("OWNED_PID_FILE"),
+                    OsString::from(owned_pid_file.as_os_str()),
+                )])),
+                &[],
+                /*cwd*/ None,
+                Arc::new(LocalStdioServerLauncher::new(std::env::current_dir()?)),
+            )
+            .await?,
+        );
+        let owned_pid = wait_for_pid_file(&owned_pid_file).await?;
+        let mut unowned = tokio::process::Command::new("/bin/sleep")
+            .arg("300")
+            .spawn()?;
+        let unowned_pid = unowned.id().context("unowned process should have a pid")?;
+
+        let shutdown_client = Arc::clone(&client);
+        let first_shutdown = tokio::spawn(async move { shutdown_client.shutdown().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        first_shutdown.abort();
+        assert!(
+            first_shutdown
+                .await
+                .expect_err("first shutdown caller should be cancelled")
+                .is_cancelled()
+        );
+
+        let second_client = Arc::clone(&client);
+        let mut second_shutdown =
+            tokio::spawn(async move { second_client.shutdown().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut second_shutdown)
+                .await
+                .is_err(),
+            "second shutdown must wait for the shared SIGKILL cleanup"
+        );
+        tokio::time::timeout(Duration::from_secs(5), &mut second_shutdown)
+            .await
+            .context("second shutdown did not observe cleanup completion")??;
+        assert!(
+            !process_exists(owned_pid),
+            "TERM-resistant MCP must be gone before second shutdown succeeds"
+        );
+        assert!(
+            process_exists(unowned_pid),
+            "cleanup must preserve a process outside the owned group"
+        );
+        unowned.kill().await?;
+        let _ = unowned.wait().await?;
+        Ok::<u32, anyhow::Error>(owned_pid)
+    })?;
+
+    drop(runtime);
+    assert!(
+        !process_exists(owned_pid),
+        "MCP must remain gone after the Tokio runtime exits immediately"
+    );
+    Ok(())
+}
+
+async fn initialized_test_server(pid_file: &Path) -> Result<(Arc<RmcpClient>, u32)> {
+    let client = Arc::new(
+        RmcpClient::new_stdio_client(
+            stdio_server_bin()?.into(),
+            Vec::<OsString>::new(),
+            Some(HashMap::from([(
+                OsString::from("MCP_TEST_PID_FILE"),
+                OsString::from(pid_file.as_os_str()),
+            )])),
+            &[],
+            /*cwd*/ None,
+            Arc::new(LocalStdioServerLauncher::new(std::env::current_dir()?)),
+        )
+        .await?,
+    );
+    client
+        .initialize(
+            init_params(),
+            Some(Duration::from_secs(5)),
+            Box::new(|_, _| async { unreachable!("test does not elicit") }.boxed()),
+        )
+        .await?;
+    let server_pid = wait_for_pid_file(pid_file).await?;
+    Ok((client, server_pid))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_timed_out_and_cancelled_calls_still_allow_shutdown() -> Result<()> {
+    let failed_dir = tempfile::tempdir()?;
+    let (failed_client, failed_pid) =
+        initialized_test_server(&failed_dir.path().join("failed-call.pid")).await?;
+
+    let failed_call = failed_client
+        .call_tool(
+            "missing-tool".to_string(),
+            /*arguments*/ None,
+            /*meta*/ None,
+            Some(Duration::from_secs(1)),
+        )
+        .await;
+    assert!(failed_call.is_err(), "unknown tool call should fail");
+    failed_client.shutdown().await;
+    assert!(!process_exists(failed_pid));
+
+    let timeout_dir = tempfile::tempdir()?;
+    let (timeout_client, timeout_pid) =
+        initialized_test_server(&timeout_dir.path().join("timeout.pid")).await?;
+    let timed_out_call = timeout_client
+        .call_tool(
+            "sync".to_string(),
+            Some(json!({ "sleep_after_ms": 300_000 })),
+            /*meta*/ None,
+            Some(Duration::from_millis(25)),
+        )
+        .await;
+    assert!(timed_out_call.is_err(), "slow tool call should time out");
+    timeout_client.shutdown().await;
+    assert!(!process_exists(timeout_pid));
+
+    let cancelled_dir = tempfile::tempdir()?;
+    let (cancelled_client, cancelled_pid) =
+        initialized_test_server(&cancelled_dir.path().join("cancelled.pid")).await?;
+    let call_client = Arc::clone(&cancelled_client);
+    let call_task = tokio::spawn(async move {
+        call_client
+            .call_tool(
+                "sync".to_string(),
+                Some(json!({ "sleep_after_ms": 300_000 })),
+                /*meta*/ None,
+                Some(Duration::from_secs(300)),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    call_task.abort();
+    assert!(
+        call_task
+            .await
+            .expect_err("call task should be cancelled")
+            .is_cancelled()
+    );
+    cancelled_client.shutdown().await;
+    assert!(!process_exists(cancelled_pid));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initialization_failure_then_shutdown_terminates_owned_server() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let server_pid_file = temp_dir.path().join("init-failure.pid");
+    let client = RmcpClient::new_stdio_client(
+        OsString::from("/bin/sh"),
+        vec![
+            OsString::from("-c"),
+            OsString::from("echo \"$$\" > \"$SERVER_PID_FILE\"; cat >/dev/null"),
+        ],
+        Some(HashMap::from([(
+            OsString::from("SERVER_PID_FILE"),
+            OsString::from(server_pid_file.as_os_str()),
+        )])),
+        &[],
+        /*cwd*/ None,
+        Arc::new(LocalStdioServerLauncher::new(std::env::current_dir()?)),
+    )
+    .await?;
+    let server_pid = wait_for_pid_file(&server_pid_file).await?;
+
+    let initialization = client
+        .initialize(
+            init_params(),
+            Some(Duration::from_millis(50)),
+            Box::new(|_, _| async { unreachable!("test does not elicit") }.boxed()),
+        )
+        .await;
+    assert!(
+        initialization.is_err(),
+        "non-MCP process should fail startup"
+    );
+
+    client.shutdown().await;
+    assert!(!process_exists(server_pid));
+    Ok(())
+}
