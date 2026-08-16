@@ -129,6 +129,62 @@ async fn refresh_keeps_superseded_mcp_server_alive_for_in_flight_calls() -> anyh
     wait_for_process_exit(&superseded_pid).await?;
     assert!(process_is_alive(&replacement_pid)?);
 
+    let shutdown_barrier = serde_json::json!({
+        "id": "mcp-shutdown-cleanup",
+        "participants": 2,
+        "timeout_ms": 1_000
+    });
+    let leased_call = tokio::spawn({
+        let codex = Arc::clone(&fixture.codex);
+        let shutdown_barrier = shutdown_barrier.clone();
+        async move {
+            codex
+                .call_mcp_tool(
+                    "refresh_cleanup",
+                    "sync",
+                    Some(serde_json::json!({
+                        "barrier": shutdown_barrier,
+                        "sleep_after_ms": 300_000
+                    })),
+                    /*meta*/ None,
+                )
+                .await
+        }
+    });
+    fixture
+        .codex
+        .call_mcp_tool(
+            "refresh_cleanup",
+            "sync",
+            Some(serde_json::json!({ "barrier": shutdown_barrier })),
+            /*meta*/ None,
+        )
+        .await?;
+    fs::remove_file(&pid_file)?;
+
+    responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("resp-2"),
+            responses::ev_assistant_message("msg-2", "done"),
+            responses::ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+    fixture.codex.submit(Op::RefreshMcpServers).await?;
+    fixture.submit_turn("refresh MCP servers again").await?;
+
+    let final_pid = wait_for_pid_file(&pid_file).await?;
+    assert_ne!(final_pid, replacement_pid);
+    assert!(process_is_alive(&replacement_pid)?);
+    assert!(process_is_alive(&final_pid)?);
+
     fixture.codex.shutdown_and_wait().await?;
-    wait_for_process_exit(&replacement_pid).await
+    wait_for_process_exit(&replacement_pid).await?;
+    wait_for_process_exit(&final_pid).await?;
+    tokio::time::timeout(Duration::from_secs(5), leased_call)
+        .await
+        .expect("leased call should finish when final shutdown stops its connection")?
+        .expect_err("leased call should fail when final shutdown stops its connection");
+    Ok(())
 }

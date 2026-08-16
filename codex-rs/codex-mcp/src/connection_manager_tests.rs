@@ -2901,19 +2901,12 @@ async fn shutdown_cancels_dormant_lazy_startup_without_polling_it() {
 }
 
 #[tokio::test]
-async fn shutdown_continues_after_caller_is_aborted() {
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+async fn shutdown_runs_concurrently_and_continues_after_caller_is_aborted() {
+    let started = Arc::new(AtomicUsize::new(0));
+    let started_notify = Arc::new(Notify::new());
+    let completed = Arc::new(AtomicUsize::new(0));
+    let completed_notify = Arc::new(Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
-    let release_for_client = Arc::clone(&release);
-    let blocking_client = async move {
-        let _ = started_tx.send(());
-        release_for_client.notified().await;
-        let _ = completed_tx.send(());
-        Err(StartupOutcomeError::Cancelled)
-    }
-    .boxed()
-    .shared();
     let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     let permission_profile = Constrained::allow_any(PermissionProfile::default());
     let mut manager = McpConnectionSet::new_uninitialized(
@@ -2921,37 +2914,57 @@ async fn shutdown_continues_after_caller_is_aborted() {
         &permission_profile,
         /*prefix_mcp_tool_names*/ true,
     );
-    manager.insert_test_client(
-        CODEX_APPS_MCP_SERVER_NAME.to_string(),
-        AsyncManagedClient {
-            client: blocking_client,
-            is_codex_apps_mcp_server: true,
-            cached_server_info: None,
-            codex_apps_tools_cache_context: None,
-            tool_catalog_cache_context: None,
-            startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            startup_reconnect: None,
-            cancel_token: CancellationToken::new(),
-        },
-    );
+    for server_name in ["first", "second"] {
+        let started = Arc::clone(&started);
+        let started_notify = Arc::clone(&started_notify);
+        let completed = Arc::clone(&completed);
+        let completed_notify = Arc::clone(&completed_notify);
+        let release = Arc::clone(&release);
+        let blocking_client = async move {
+            if started.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                started_notify.notify_one();
+            }
+            release.notified().await;
+            if completed.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                completed_notify.notify_one();
+            }
+            Err(StartupOutcomeError::Cancelled)
+        }
+        .boxed()
+        .shared();
+        manager.insert_test_client(
+            server_name,
+            AsyncManagedClient {
+                client: blocking_client,
+                is_codex_apps_mcp_server: false,
+                cached_server_info: None,
+                codex_apps_tools_cache_context: None,
+                tool_catalog_cache_context: None,
+                startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                startup_reconnect: None,
+                cancel_token: CancellationToken::new(),
+            },
+        );
+    }
     let manager = Arc::new(manager);
     let shutdown_task = tokio::spawn({
         let manager = Arc::clone(&manager);
         async move { manager.shutdown().await }
     });
 
-    started_rx.await.expect("client shutdown should start");
+    tokio::time::timeout(Duration::from_secs(1), started_notify.notified())
+        .await
+        .expect("all client shutdowns should start concurrently");
     shutdown_task.abort();
     let shutdown_error = shutdown_task
         .await
         .expect_err("caller shutdown task should be aborted");
     assert!(shutdown_error.is_cancelled());
-    release.notify_one();
+    release.notify_waiters();
 
-    tokio::time::timeout(Duration::from_secs(1), completed_rx)
+    tokio::time::timeout(Duration::from_secs(1), completed_notify.notified())
         .await
-        .expect("client shutdown should survive caller cancellation")
-        .expect("client shutdown completion sender should stay alive");
+        .expect("all client shutdowns should survive caller cancellation");
 }
 
 #[tokio::test]
