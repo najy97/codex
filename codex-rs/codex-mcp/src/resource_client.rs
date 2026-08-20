@@ -21,6 +21,7 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use crate::McpRuntime;
+use crate::connection_manager::McpConnectionLease;
 use crate::connection_manager::McpConnectionSet;
 use crate::connection_manager::McpServerConnection;
 use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
@@ -71,6 +72,7 @@ pub struct McpEventStream {
     runtime_handle: Handle,
     connection: Option<Arc<McpServerConnection>>,
     hosted_event_server_removals: watch::Receiver<()>,
+    lease: McpConnectionLease,
 }
 
 impl McpEventStream {
@@ -121,6 +123,7 @@ impl McpEventStream {
         {
             drop(notifications);
             let connection = self.connection.take();
+            let lease = self.lease.clone();
             self.runtime_handle.spawn(async move {
                 let _ = tokio::time::timeout(
                     Duration::from_secs(30),
@@ -128,6 +131,7 @@ impl McpEventStream {
                 )
                 .await;
                 drop(connection);
+                drop(lease);
             });
         }
     }
@@ -197,11 +201,9 @@ impl McpResourceClient {
     ) -> Result<McpResourcePage> {
         let params =
             cursor.map(|cursor| PaginatedRequestParams::default().with_cursor(Some(cursor)));
-        let result = self
-            .runtime
-            .latest_connections()
-            .list_resources(server, params)
-            .await?;
+        let connections = self.runtime.latest_connections();
+        let _lease = connections.acquire_lease();
+        let result = connections.list_resources(server, params).await?;
         let resources = result
             .resources
             .into_iter()
@@ -216,11 +218,9 @@ impl McpResourceClient {
     /// Reads one resource from the named server.
     pub async fn read_resource(&self, server: &str, uri: &str) -> Result<McpResourceReadResult> {
         let params = ReadResourceRequestParams::new(uri.to_string());
-        let result = self
-            .runtime
-            .latest_connections()
-            .read_resource(server, params)
-            .await?;
+        let connections = self.runtime.latest_connections();
+        let _lease = connections.acquire_lease();
+        let result = connections.read_resource(server, params).await?;
         let contents = result
             .contents
             .into_iter()
@@ -234,6 +234,7 @@ impl McpResourceClient {
         let (connections, _) = self
             .runtime
             .latest_connections_for_event_server(CODEX_APPS_MCP_SERVER_NAME)?;
+        let _lease = connections.acquire_lease();
         let cache_key = McpResourceClientCacheKey(Arc::downgrade(&connections));
         let (managed, request_timeout) = connections
             .client_by_name(CODEX_APPS_MCP_SERVER_NAME)
@@ -274,6 +275,7 @@ impl McpResourceClient {
         let (connections, hosted_event_server_removals) = self
             .runtime
             .latest_connections_for_event_server(CODEX_APPS_MCP_SERVER_NAME)?;
+        let lease = connections.acquire_lease();
         let (managed, _, connection) = connections
             .client_with_connection_by_name(CODEX_APPS_MCP_SERVER_NAME)
             .await?;
@@ -288,6 +290,7 @@ impl McpResourceClient {
             runtime_handle: Handle::current(),
             connection: Some(connection),
             hosted_event_server_removals,
+            lease,
         })
     }
 }

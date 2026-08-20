@@ -374,7 +374,7 @@ pub(crate) struct SessionIo {
     pub(crate) session_loop_termination: SessionLoopTermination,
 }
 
-pub(crate) type SessionLoopTermination = Shared<BoxFuture<'static, ()>>;
+pub(crate) type SessionLoopTermination = Shared<BoxFuture<'static, Result<(), Arc<String>>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GitEnrichmentPolicy {
@@ -783,13 +783,15 @@ impl Session {
         let session_loop_handle = tokio::spawn(async move {
             submission_loop(session_for_loop, configured_config, rx_sub)
                 .instrument(info_span!("session_loop", thread_id = %thread_id))
-                .await;
+                .await
         });
         let io = SessionIo {
             tx_sub,
             rx_event,
             agent_status: agent_status_rx,
-            session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
+            session_loop_termination: session_loop_termination_from_result_handle(
+                session_loop_handle,
+            ),
         };
 
         Ok((session, io))
@@ -891,8 +893,9 @@ impl SessionIo {
             Err(err) if matches!(err.details(), CodexErrorDetails::InternalAgentDied) => {}
             Err(err) => return Err(err),
         }
-        session_loop_termination.await;
-        Ok(())
+        session_loop_termination
+            .await
+            .map_err(|message| CodexErrorDetails::Fatal((*message).clone()).into())
     }
 
     pub(crate) async fn next_event(&self) -> CodexResult<Event> {
@@ -956,14 +959,29 @@ fn session_permission_profile_state_from_config(
 
 #[cfg(test)]
 pub(crate) fn completed_session_loop_termination() -> SessionLoopTermination {
-    futures::future::ready(()).boxed().shared()
+    futures::future::ready(Ok(())).boxed().shared()
 }
 
+#[cfg(test)]
 pub(crate) fn session_loop_termination_from_handle(
     handle: JoinHandle<()>,
 ) -> SessionLoopTermination {
     async move {
-        let _ = handle.await;
+        handle
+            .await
+            .map_err(|error| Arc::new(format!("session loop task failed: {error}")))
+    }
+    .boxed()
+    .shared()
+}
+
+fn session_loop_termination_from_result_handle(
+    handle: JoinHandle<Result<(), Arc<String>>>,
+) -> SessionLoopTermination {
+    async move {
+        handle
+            .await
+            .map_err(|error| Arc::new(format!("session loop task failed: {error}")))?
     }
     .boxed()
     .shared()

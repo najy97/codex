@@ -232,13 +232,13 @@ async fn prepared_call_keeps_captured_connection_and_authority_after_refresh() -
 
     drop(old.step);
     assert!(
-        old_connections.upgrade().is_some(),
-        "the prepared call should keep its captured connection set alive"
-    );
-    drop(old_call);
-    assert!(
         old_connections.upgrade().is_none(),
-        "the captured connection set should be released with the prepared call"
+        "explicit leases should not retain the whole captured connection set"
+    );
+    assert_eq!(
+        old_call._lease.active_count(),
+        1,
+        "the prepared call should keep one explicit connection lease"
     );
     Ok(())
 }

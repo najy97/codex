@@ -3,6 +3,7 @@ use crate::realtime_conversation::handle_close as handle_realtime_conversation_c
 use crate::realtime_conversation::handle_speech as handle_realtime_conversation_speech;
 use crate::realtime_conversation::handle_start as handle_realtime_conversation_start;
 use crate::realtime_conversation::handle_text as handle_realtime_conversation_text;
+use anyhow::Context;
 use async_channel::Receiver;
 use codex_otel::set_parent_from_w3c_trace_context;
 use codex_protocol::protocol::Submission;
@@ -394,7 +395,7 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
     }
 }
 
-async fn shutdown_session_runtime(sess: &Arc<Session>) {
+async fn shutdown_session_runtime(sess: &Arc<Session>) -> anyhow::Result<()> {
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }
@@ -411,14 +412,15 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) {
         warn!("failed to shutdown code mode session: {err}");
     }
     sess.stop_mcp_prewarm_worker().await;
-    {
+    let mcp_shutdown_result = {
         let _refresh = sess.mcp_refresh.acquire().await;
         sess.mcp_refresh.close();
-        sess.services.mcp_runtime.shutdown().await;
-    }
+        sess.services.mcp_runtime.shutdown().await
+    };
     sess.guardian_review_session.shutdown().await;
 
     crate::hook_runtime::run_session_end_hooks(sess).await;
+    mcp_shutdown_result.context("failed to shut down MCP runtime")
 }
 
 async fn emit_thread_stop_lifecycle(sess: &Session) {
@@ -432,8 +434,8 @@ async fn emit_thread_stop_lifecycle(sess: &Session) {
     }
 }
 
-pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
-    shutdown_session_runtime(sess).await;
+pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> anyhow::Result<()> {
+    let runtime_shutdown_result = shutdown_session_runtime(sess).await;
     info!("Shutting down Codex instance");
     let history = sess.clone_history().await;
     let turn_count = history
@@ -466,7 +468,15 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
 
     let event = Event {
         id: sub_id,
-        msg: EventMsg::ShutdownComplete,
+        msg: match &runtime_shutdown_result {
+            Ok(()) => EventMsg::ShutdownComplete,
+            Err(error) => EventMsg::Error(ErrorEvent {
+                message: format!(
+                    "Session shutdown could not confirm MCP process cleanup: {error:#}"
+                ),
+                codex_error_info: Some(CodexErrorInfo::Other),
+            }),
+        },
     };
     sess.services
         .rollout_thread_trace
@@ -474,8 +484,12 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
     sess.deliver_event_raw(event).await;
     sess.services
         .rollout_thread_trace
-        .record_ended(codex_rollout_trace::RolloutStatus::Completed);
-    true
+        .record_ended(if runtime_shutdown_result.is_ok() {
+            codex_rollout_trace::RolloutStatus::Completed
+        } else {
+            codex_rollout_trace::RolloutStatus::Failed
+        });
+    runtime_shutdown_result
 }
 
 pub async fn review(
@@ -516,9 +530,10 @@ pub(super) async fn submission_loop(
     sess: Arc<Session>,
     config: Arc<Config>,
     rx_sub: Receiver<Submission>,
-) {
+) -> Result<(), Arc<String>> {
     // To break out of this loop, send Op::Shutdown.
     let mut shutdown_received = false;
+    let mut shutdown_error = None;
     while let Ok(sub) = rx_sub.recv().await {
         debug!(?sub, "Submission");
         let dispatch_span = submission_dispatch_span(&sub);
@@ -659,7 +674,12 @@ pub(super) async fn submission_loop(
                         .await;
                     false
                 }
-                Op::Shutdown => shutdown(&sess, sub.id.clone()).await,
+                Op::Shutdown => {
+                    if let Err(error) = shutdown(&sess, sub.id.clone()).await {
+                        shutdown_error = Some(Arc::new(format!("{error:#}")));
+                    }
+                    true
+                }
                 Op::Review { review_request } => {
                     review(&sess, &config, sub.id.clone(), review_request).await;
                     false
@@ -681,7 +701,9 @@ pub(super) async fn submission_loop(
     // If the submission loop exits because the channel closed without an
     // explicit shutdown op, still run session teardown.
     if !shutdown_received {
-        shutdown_session_runtime(&sess).await;
+        if let Err(error) = shutdown_session_runtime(&sess).await {
+            shutdown_error = Some(Arc::new(format!("{error:#}")));
+        }
         emit_thread_stop_lifecycle(sess.as_ref()).await;
         if let Some(live_thread) = sess.live_thread()
             && let Err(err) = live_thread.shutdown().await
@@ -690,6 +712,7 @@ pub(super) async fn submission_loop(
         }
     }
     debug!("Agent loop exited");
+    shutdown_error.map_or(Ok(()), Err)
 }
 
 async fn approve_guardian_denied_action(sess: &Arc<Session>, event: GuardianAssessmentEvent) {

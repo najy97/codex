@@ -127,7 +127,7 @@ impl AppsRequestProcessor {
                         ))
                     };
                     cancellation_token.cancel();
-                    runtime.shutdown().await;
+                    runtime.shutdown().await?;
                     result
                 }
                 .await;

@@ -523,13 +523,14 @@ impl AsyncManagedClient {
         }
     }
 
-    pub(crate) async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) -> Result<()> {
         self.cancel_token.cancel();
         match self.client().await {
-            Ok(client) => client.client.shutdown().await,
-            Err(StartupOutcomeError::Cancelled) => {}
+            Ok(client) => client.client.try_shutdown().await.map_err(Into::into),
+            Err(StartupOutcomeError::Cancelled) => Ok(()),
             Err(error) => {
                 warn!("failed to initialize MCP client during shutdown: {error:#}");
+                Ok(())
             }
         }
     }
@@ -1099,9 +1100,12 @@ async fn make_rmcp_client(
                 // TODO(starr): Unify local stdio MCP launch with
                 // `ExecutorStdioServerLauncher` once the executor-backed path
                 // preserves `LocalStdioServerLauncher` semantics.
-                Arc::new(LocalStdioServerLauncher::new(
-                    runtime_context.local_process_cwd(),
-                )) as Arc<dyn StdioServerLauncher>
+                Arc::new(
+                    LocalStdioServerLauncher::new(runtime_context.local_process_cwd())
+                        .with_process_supervisor(
+                            codex_rmcp_client::configured_mcp_process_supervisor_exe(),
+                        ),
+                ) as Arc<dyn StdioServerLauncher>
             } else {
                 let Some(environment) = resolved_environment.as_ref() else {
                     unreachable!(

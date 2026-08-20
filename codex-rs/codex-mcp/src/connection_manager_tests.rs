@@ -108,6 +108,7 @@ impl McpConnectionSet {
                 /*lifecycle*/ None,
                 ElicitationRequestRouter::default(),
             ),
+            lease_tracker: Arc::new(McpConnectionLeaseTracker::new()),
         }
     }
 
@@ -2868,9 +2869,51 @@ async fn shutdown_cancels_pending_tool_listing() {
     started_rx.await.expect("tool listing should start");
     tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
         .await
-        .expect("shutdown should cancel speculative tool listing");
+        .expect("shutdown should cancel speculative tool listing")
+        .expect("speculative tool listing cleanup should succeed");
     let tools = list_task.await.expect("tool listing task should not panic");
     assert!(tools.is_empty());
+}
+
+#[tokio::test]
+async fn explicit_connection_lease_waits_for_the_last_guard() {
+    let manager = Arc::new(McpConnectionSet::empty(/*prefix_mcp_tool_names*/ true));
+    let first_lease = manager.acquire_lease();
+    let second_lease = first_lease.clone();
+    let tracker = Arc::clone(&manager.lease_tracker);
+    let mut waiter = tokio::spawn(async move { tracker.wait_until_released().await });
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut waiter)
+            .await
+            .is_err(),
+        "retirement must wait while any explicit lease remains"
+    );
+    drop(first_lease);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut waiter)
+            .await
+            .is_err(),
+        "retirement must wait for the final explicit lease"
+    );
+    drop(second_lease);
+    tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("retirement should observe the final lease release")
+        .expect("lease waiter should not panic");
+}
+
+#[tokio::test]
+async fn unrelated_connection_set_arc_is_not_a_lease() {
+    let manager = Arc::new(McpConnectionSet::empty(/*prefix_mcp_tool_names*/ true));
+    let _unrelated_reference = Arc::clone(&manager);
+
+    tokio::time::timeout(
+        Duration::from_millis(25),
+        manager.lease_tracker.wait_until_released(),
+    )
+    .await
+    .expect("an unrelated Arc must not delay retirement");
 }
 
 #[tokio::test]
@@ -2895,7 +2938,8 @@ async fn shutdown_cancels_dormant_lazy_startup_without_polling_it() {
 
     tokio::time::timeout(Duration::from_millis(50), connection.shutdown())
         .await
-        .expect("dormant startup must not be polled by shutdown");
+        .expect("dormant startup must not be polled by shutdown")
+        .expect("dormant startup cleanup should succeed");
 
     assert!(cancel_token.is_cancelled());
 }

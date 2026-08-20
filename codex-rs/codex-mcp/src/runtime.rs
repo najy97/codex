@@ -98,6 +98,9 @@ pub struct McpRuntime {
     // Weak handles keep retired generations reachable for final thread
     // shutdown without extending the lifetime of their binding leases.
     retired_connections: AsyncMutex<Vec<Weak<McpServerConnection>>>,
+    // A failed retirement keeps strong ownership until final shutdown can
+    // retry it. Otherwise the weak entry could disappear after a failed task.
+    failed_retired_connections: Arc<AsyncMutex<Vec<Arc<McpServerConnection>>>>,
     reconnect_pending: AtomicBool,
     elicitation_router: ElicitationRequestRouter,
     resource_origins: Mutex<ResourceOrigins>,
@@ -184,6 +187,7 @@ impl McpRuntime {
             }),
             hosted_event_server_removals: watch::channel(()).0,
             retired_connections: AsyncMutex::new(Vec::new()),
+            failed_retired_connections: Arc::new(AsyncMutex::new(Vec::new())),
             reconnect_pending: AtomicBool::new(false),
             elicitation_router: ElicitationRequestRouter::default(),
             resource_origins: Mutex::default(),
@@ -311,7 +315,16 @@ impl McpRuntime {
                 .lock()
                 .await
                 .extend(retirement.connections.iter().map(Arc::downgrade));
-            std::mem::drop(tokio::spawn(retirement.shutdown_when_unleased()));
+            let failed_retired_connections = Arc::clone(&self.failed_retired_connections);
+            std::mem::drop(tokio::spawn(async move {
+                if let Err(failure) = retirement.shutdown_when_unleased().await {
+                    tracing::warn!(%failure, "retired MCP connection cleanup failed");
+                    failed_retired_connections
+                        .lock()
+                        .await
+                        .extend(failure.connections);
+                }
+            }));
         }
         self.current.store(Arc::new(PublishedMcpRuntime {
             connections,
@@ -483,9 +496,9 @@ impl McpRuntime {
     pub async fn latest_hard_refresh_codex_apps_tools_cache(
         &self,
     ) -> anyhow::Result<Vec<ToolInfo>> {
-        self.latest_connections()
-            .hard_refresh_codex_apps_tools_cache()
-            .await
+        let connections = self.latest_connections();
+        let _lease = connections.acquire_lease();
+        connections.hard_refresh_codex_apps_tools_cache().await
     }
 
     /// Lists the latest known tools for non-model discovery surfaces.
@@ -493,7 +506,9 @@ impl McpRuntime {
     /// Unlike [`Self::current_binding`], this may return cached tools while their
     /// client reconnects because callers only inspect tool metadata.
     pub async fn latest_list_all_tools(&self) -> Vec<ToolInfo> {
-        self.latest_connections().list_all_tools().await
+        let connections = self.latest_connections();
+        let _lease = connections.acquire_lease();
+        connections.list_all_tools().await
     }
 
     pub async fn latest_call_tool(
@@ -505,7 +520,9 @@ impl McpRuntime {
         requested_timeout: Option<Duration>,
         wait_for_server: bool,
     ) -> anyhow::Result<CallToolResult> {
-        self.latest_connections()
+        let connections = self.latest_connections();
+        let _lease = connections.acquire_lease();
+        connections
             .call_tool(
                 server,
                 tool,
@@ -522,19 +539,21 @@ impl McpRuntime {
         server: &str,
         params: ReadResourceRequestParams,
     ) -> anyhow::Result<ReadResourceResult> {
-        self.latest_connections()
-            .read_resource(server, params)
-            .await
+        let connections = self.latest_connections();
+        let _lease = connections.acquire_lease();
+        connections.read_resource(server, params).await
     }
 
     pub async fn latest_wait_for_server_ready(&self, server: &str, timeout: Duration) -> bool {
-        self.latest_connections()
-            .wait_for_server_ready(server, timeout)
-            .await
+        let connections = self.latest_connections();
+        let _lease = connections.acquire_lease();
+        connections.wait_for_server_ready(server, timeout).await
     }
 
     pub async fn validate_required_servers(&self) -> anyhow::Result<()> {
-        self.latest_connections().validate_required_servers().await
+        let connections = self.latest_connections();
+        let _lease = connections.acquire_lease();
+        connections.validate_required_servers().await
     }
 
     pub fn cancel_startup(&self) {
@@ -571,29 +590,65 @@ impl McpRuntime {
     }
 
     /// Force-stops every generation owned by the thread during final shutdown.
-    pub async fn shutdown(&self) {
-        let connections = self
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        let mut connections = self
             .retired_connections
             .lock()
             .await
             .iter()
             .filter_map(Weak::upgrade)
             .collect::<Vec<_>>();
+        for connection in std::mem::take(&mut *self.failed_retired_connections.lock().await) {
+            if !connections
+                .iter()
+                .any(|tracked| Arc::ptr_eq(tracked, &connection))
+            {
+                connections.push(connection);
+            }
+        }
         let current = self.latest_connections();
+        let failed_retired_connections = Arc::clone(&self.failed_retired_connections);
 
         // The task owns the complete batch independently of its caller. If the
         // first shutdown caller is cancelled, a later caller can still invoke
         // shutdown again and await the same per-process cleanup completions.
         let shutdown_task = tokio::spawn(async move {
-            let retired_shutdown = futures::future::join_all(
-                connections
-                    .into_iter()
-                    .map(|connection| async move { connection.shutdown().await }),
-            );
-            let (_, _) = tokio::join!(current.shutdown(), retired_shutdown);
+            let retired_shutdown =
+                futures::future::join_all(connections.into_iter().map(|connection| async move {
+                    let result = connection.shutdown().await;
+                    (connection, result)
+                }));
+            let (current_result, retired_results) =
+                tokio::join!(current.shutdown(), retired_shutdown);
+            let mut failed_connections = Vec::new();
+            let mut failures = Vec::new();
+            for (connection, result) in retired_results {
+                if let Err(error) = result {
+                    failed_connections.push(connection);
+                    failures.push(format!("{error:#}"));
+                }
+            }
+            if !failed_connections.is_empty() {
+                failed_retired_connections
+                    .lock()
+                    .await
+                    .extend(failed_connections);
+            }
+            if let Err(error) = current_result {
+                failures.push(format!("{error:#}"));
+            }
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(
+                    "one or more MCP runtime connections failed to shut down: {}",
+                    failures.join("; ")
+                ))
+            }
         });
-        if let Err(error) = shutdown_task.await {
-            tracing::warn!(%error, "MCP runtime shutdown task failed");
+        match shutdown_task.await {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::anyhow!("MCP runtime shutdown task failed: {error}")),
         }
     }
 }

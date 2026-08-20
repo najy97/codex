@@ -7556,7 +7556,9 @@ async fn shutdown_complete_does_not_append_to_thread_store_after_shutdown() {
     session.async_hook_results = result_receiver;
     let session = Arc::new(session);
 
-    assert!(handlers::shutdown(&session, "sub-1".to_string()).await);
+    handlers::shutdown(&session, "sub-1".to_string())
+        .await
+        .expect("session shutdown");
     assert!(session.async_hook_results.is_closed());
     assert!(session.async_hook_results.is_empty());
     assert!(result_sender.is_closed());
@@ -7655,7 +7657,7 @@ async fn submission_loop_channel_close_runs_full_thread_teardown() {
     let (tx_sub, rx_sub) = async_channel::bounded(1);
     drop(tx_sub);
     let session = Arc::new(session);
-    submission_loop(session, Arc::clone(&turn_context.config), rx_sub).await;
+    let _ = submission_loop(session, Arc::clone(&turn_context.config), rx_sub).await;
 
     assert_eq!(1, calls.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(
@@ -7740,7 +7742,7 @@ async fn submission_loop_channel_close_aborts_active_turn_before_thread_stop_lif
 
     let (tx_sub, rx_sub) = async_channel::bounded(1);
     drop(tx_sub);
-    submission_loop(Arc::clone(&session), session.get_config().await, rx_sub).await;
+    let _ = submission_loop(Arc::clone(&session), session.get_config().await, rx_sub).await;
 
     assert_eq!(
         vec!["turn_abort", "thread_stop"],
@@ -7787,6 +7789,30 @@ async fn shutdown_and_wait_allows_multiple_waiters() {
 }
 
 #[tokio::test]
+async fn shutdown_and_wait_surfaces_session_loop_cleanup_failure() {
+    let (tx_sub, rx_sub) = async_channel::bounded::<Submission>(1);
+    let (_tx_event, rx_event) = async_channel::unbounded();
+    let session_loop_handle = tokio::spawn(async move {
+        let shutdown = rx_sub.recv().await.expect("shutdown submission");
+        assert!(matches!(shutdown.op, Op::Shutdown));
+        Err(Arc::new("injected MCP cleanup failure".to_string()))
+    });
+    let io = SessionIo {
+        tx_sub,
+        rx_event,
+        agent_status: watch::channel(AgentStatus::PendingInit).1,
+        session_loop_termination: session_loop_termination_from_result_handle(session_loop_handle),
+    };
+
+    let error = io
+        .shutdown_and_wait()
+        .await
+        .expect_err("cleanup failure must reach shutdown waiter");
+
+    assert!(error.to_string().contains("injected MCP cleanup failure"));
+}
+
+#[tokio::test]
 async fn shutdown_and_wait_waits_when_shutdown_is_already_in_progress() {
     let (_session, _turn_context) = make_session_and_context().await;
     let (tx_sub, rx_sub) = async_channel::bounded(4);
@@ -7830,7 +7856,7 @@ async fn shutdown_and_wait_shuts_down_cached_guardian_subagent() {
     let (_parent_tx_event, parent_rx_event) = async_channel::unbounded();
     let parent_session_for_loop = Arc::clone(&parent_session);
     let parent_session_loop_handle = tokio::spawn(async move {
-        submission_loop(parent_session_for_loop, parent_config, parent_rx_sub).await;
+        let _ = submission_loop(parent_session_for_loop, parent_config, parent_rx_sub).await;
     });
     let parent_io = SessionIo {
         tx_sub: parent_tx_sub,
@@ -7915,7 +7941,7 @@ async fn shutdown_and_wait_shuts_down_tracked_ephemeral_guardian_review() {
     let (_parent_tx_event, parent_rx_event) = async_channel::unbounded();
     let parent_session_for_loop = Arc::clone(&parent_session);
     let parent_session_loop_handle = tokio::spawn(async move {
-        submission_loop(parent_session_for_loop, parent_config, parent_rx_sub).await;
+        let _ = submission_loop(parent_session_for_loop, parent_config, parent_rx_sub).await;
     });
     let parent_io = SessionIo {
         tx_sub: parent_tx_sub,

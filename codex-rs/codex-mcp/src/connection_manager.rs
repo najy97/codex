@@ -24,6 +24,7 @@ pub use tool_catalog::tool_is_model_visible;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -69,12 +70,29 @@ use codex_protocol::protocol::McpStartupStatus;
 use codex_protocol::protocol::McpStartupUpdateEvent;
 use codex_rmcp_client::determine_streamable_http_auth_status_from_credentials;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio::sync::RwLock;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::warn;
 
 static LIVE_CONNECTIONS: Gauge = Gauge::new("mcp.connections.live");
+
+fn collect_shutdown_failures(outcomes: Vec<Result<()>>) -> Result<()> {
+    let failures = outcomes
+        .into_iter()
+        .filter_map(Result::err)
+        .map(|error| format!("{error:#}"))
+        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "one or more MCP servers failed to shut down: {}",
+            failures.join("; ")
+        ))
+    }
+}
 
 pub(crate) struct McpServerConnection {
     identity: Option<McpServerConnectionIdentity>,
@@ -128,12 +146,12 @@ impl McpServerConnection {
         self.client.client().await
     }
 
-    pub(crate) async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) -> Result<()> {
         if self.startup_is_dormant() {
             self.client.cancel_token.cancel();
-            return;
+            return Ok(());
         }
-        self.client.shutdown().await;
+        self.client.shutdown().await
     }
 
     fn cancel_startup(&self) {
@@ -192,6 +210,69 @@ pub(crate) struct McpConnectionSet {
     prefix_mcp_tool_names: bool,
     non_prefixed_mcp_tool_servers: Vec<String>,
     elicitation_requests: ElicitationRequestManager,
+    lease_tracker: Arc<McpConnectionLeaseTracker>,
+}
+
+struct McpConnectionLeaseTracker {
+    active: AtomicUsize,
+    released: Notify,
+}
+
+pub(crate) struct McpConnectionLease {
+    tracker: Arc<McpConnectionLeaseTracker>,
+}
+
+impl Clone for McpConnectionLease {
+    fn clone(&self) -> Self {
+        self.tracker.active.fetch_add(1, Ordering::Relaxed);
+        Self {
+            tracker: Arc::clone(&self.tracker),
+        }
+    }
+}
+
+impl Drop for McpConnectionLease {
+    fn drop(&mut self) {
+        if self.tracker.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.tracker.released.notify_waiters();
+        }
+    }
+}
+
+#[cfg(test)]
+impl McpConnectionLease {
+    pub(crate) fn active_count(&self) -> usize {
+        self.tracker.active.load(Ordering::Acquire)
+    }
+}
+
+impl McpConnectionLeaseTracker {
+    fn new() -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            released: Notify::new(),
+        }
+    }
+
+    fn acquire(self: &Arc<Self>) -> McpConnectionLease {
+        self.active.fetch_add(1, Ordering::Relaxed);
+        McpConnectionLease {
+            tracker: Arc::clone(self),
+        }
+    }
+
+    async fn wait_until_released(&self) {
+        loop {
+            if self.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            let released = self.released.notified();
+            if self.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            released.await;
+        }
+    }
 }
 
 /// Connections removed from a publication and no longer shared by its
@@ -201,24 +282,52 @@ pub(crate) struct McpConnectionSet {
 /// hold additional strong references that act as in-flight leases.
 pub(crate) struct McpConnectionRetirement {
     pub(crate) connections: Vec<Arc<McpServerConnection>>,
+    lease_tracker: Arc<McpConnectionLeaseTracker>,
+}
+
+pub(crate) struct McpConnectionRetirementFailure {
+    pub(crate) connections: Vec<Arc<McpServerConnection>>,
+    message: String,
+}
+
+impl std::fmt::Display for McpConnectionRetirementFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
 }
 
 impl McpConnectionRetirement {
     /// Waits for captured bindings to release each retired connection, then
     /// shuts all eligible connections down concurrently.
-    pub(crate) async fn shutdown_when_unleased(self) {
-        futures::future::join_all(self.connections.into_iter().map(|connection| async move {
-            // This future owns one strong reference. Because the connection is
-            // absent from the successor publication, any additional strong
-            // references are binding leases that must finish before shutdown.
-            // Final thread shutdown may upgrade a tracked Weak concurrently,
-            // which is safe because process cleanup is shared and idempotent.
-            while Arc::strong_count(&connection) > 1 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+    pub(crate) async fn shutdown_when_unleased(
+        self,
+    ) -> std::result::Result<(), McpConnectionRetirementFailure> {
+        self.lease_tracker.wait_until_released().await;
+        let outcomes =
+            futures::future::join_all(self.connections.into_iter().map(|connection| async move {
+                let result = connection.shutdown().await;
+                (connection, result)
+            }))
+            .await;
+        let mut connections = Vec::new();
+        let mut failures = Vec::new();
+        for (connection, outcome) in outcomes {
+            if let Err(error) = outcome {
+                connections.push(connection);
+                failures.push(format!("{error:#}"));
             }
-            connection.shutdown().await;
-        }))
-        .await;
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(McpConnectionRetirementFailure {
+                connections,
+                message: format!(
+                    "one or more retired MCP connections failed to shut down: {}",
+                    failures.join("; ")
+                ),
+            })
+        }
     }
 }
 
@@ -240,7 +349,10 @@ impl McpConnectionSet {
                 connections.push(Arc::clone(connection));
             }
         }
-        (!connections.is_empty()).then_some(McpConnectionRetirement { connections })
+        (!connections.is_empty()).then_some(McpConnectionRetirement {
+            connections,
+            lease_tracker: Arc::clone(&previous.lease_tracker),
+        })
     }
 
     /// Creates an MCP connection manager. Threadless callers can pass no `tx_event`; startup
@@ -723,6 +835,7 @@ impl McpConnectionSet {
             prefix_mcp_tool_names,
             non_prefixed_mcp_tool_servers,
             elicitation_requests: elicitation_requests.clone(),
+            lease_tracker: Arc::new(McpConnectionLeaseTracker::new()),
         };
         let summary_publication_gate = publication_gate;
         tokio::spawn(async move {
@@ -788,7 +901,12 @@ impl McpConnectionSet {
                 /*lifecycle*/ None,
                 ElicitationRequestRouter::default(),
             ),
+            lease_tracker: Arc::new(McpConnectionLeaseTracker::new()),
         }
+    }
+
+    pub(crate) fn acquire_lease(&self) -> McpConnectionLease {
+        self.lease_tracker.acquire()
     }
 
     pub fn has_servers(&self) -> bool {
@@ -861,26 +979,31 @@ impl McpConnectionSet {
     }
 
     /// Stop all MCP clients owned by this manager and terminate stdio server processes.
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(&self) -> Result<()> {
         let connections = self
             .servers
-            .values()
-            .map(|view| Arc::clone(&view.connection))
+            .iter()
+            .map(|(server_name, view)| (server_name.clone(), Arc::clone(&view.connection)))
             .collect::<Vec<_>>();
         // Keep cleanup alive if an interrupt cancels the refresh that requested it.
         let shutdown_task = tokio::spawn(async move {
             // A TERM grace period belongs to each process tree. Run them in
             // parallel so shutdown latency is bounded by the slowest tree,
             // rather than by the number of configured servers.
-            futures::future::join_all(
-                connections
-                    .into_iter()
-                    .map(|connection| async move { connection.shutdown().await }),
-            )
+            let outcomes = futures::future::join_all(connections.into_iter().map(
+                |(server_name, connection)| async move {
+                    connection
+                        .shutdown()
+                        .await
+                        .with_context(|| format!("failed to shut down MCP server `{server_name}`"))
+                },
+            ))
             .await;
+            collect_shutdown_failures(outcomes)
         });
-        if let Err(error) = shutdown_task.await {
-            warn!("MCP client shutdown task failed: {error}");
+        match shutdown_task.await {
+            Ok(result) => result,
+            Err(error) => Err(anyhow!("MCP client shutdown task failed: {error}")),
         }
     }
 

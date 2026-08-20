@@ -22,6 +22,7 @@ use tokio::sync::RwLock;
 
 use crate::McpConfig;
 use crate::binding_clients::McpBindingClients;
+use crate::connection_manager::McpConnectionLease;
 use crate::connection_manager::McpConnectionSet;
 use crate::rmcp_client::ManagedClient;
 use crate::server::McpServerMetadata;
@@ -30,6 +31,7 @@ use crate::tools::ToolInfo;
 /// The exact tool catalog and execution handles shared by compatible sampling steps.
 pub struct McpBinding {
     connections: Arc<McpConnectionSet>,
+    _lease: McpConnectionLease,
     clients: Arc<McpBindingClients>,
     config: Arc<McpConfig>,
     plugins_available: bool,
@@ -58,8 +60,10 @@ impl McpBinding {
         tools: Vec<ToolInfo>,
         calls: HashMap<(String, String), PreparedMcpCall>,
     ) -> Self {
+        let lease = connections.acquire_lease();
         Self {
             connections,
+            _lease: lease,
             clients,
             config,
             plugins_available,
@@ -169,7 +173,7 @@ impl fmt::Debug for McpBinding {
 /// one [`McpBinding`].
 #[derive(Clone)]
 pub struct PreparedMcpCall {
-    _connections: Arc<McpConnectionSet>,
+    _lease: McpConnectionLease,
     client: Arc<ManagedClient>,
     config: Arc<McpConfig>,
     catalog_revision: u64,
@@ -198,8 +202,9 @@ impl PreparedMcpCall {
         selected_plugin_server: bool,
     ) -> Self {
         let server_name = tool_info.server_name.clone();
+        let lease = connections.acquire_lease();
         Self {
-            _connections: connections,
+            _lease: lease,
             client,
             config,
             catalog_revision,

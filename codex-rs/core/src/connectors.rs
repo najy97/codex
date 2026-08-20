@@ -338,7 +338,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
     }
     let accessible_connectors =
         with_app_plugin_sources(accessible_connectors, &tool_plugin_provenance);
-    mcp_runtime.shutdown().await;
+    mcp_runtime.shutdown().await?;
     Ok(AccessibleConnectorsStatus {
         connectors: accessible_connectors,
         codex_apps_ready,
