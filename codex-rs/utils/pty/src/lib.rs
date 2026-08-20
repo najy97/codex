@@ -1,3 +1,5 @@
+#[cfg(unix)]
+mod mcp_process_supervisor;
 pub mod pipe;
 mod process;
 pub mod process_group;
@@ -10,6 +12,15 @@ mod win;
 mod windows_input;
 
 pub const DEFAULT_OUTPUT_BYTES_CAP: usize = 1024 * 1024;
+
+#[cfg(unix)]
+pub use mcp_process_supervisor::CODEX_MCP_PROCESS_SUPERVISOR_ARG1;
+#[cfg(unix)]
+pub use mcp_process_supervisor::configure_mcp_process_supervisor_exe;
+#[cfg(unix)]
+pub use mcp_process_supervisor::configured_mcp_process_supervisor_exe;
+#[cfg(unix)]
+pub use mcp_process_supervisor::run_mcp_process_supervisor_main;
 
 /// Spawn a non-interactive process using regular pipes for stdin/stdout/stderr.
 pub use pipe::spawn_process as spawn_pipe_process;

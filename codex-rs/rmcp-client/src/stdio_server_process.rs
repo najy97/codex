@@ -1,8 +1,6 @@
 //! Ownership and termination of processes spawned for stdio MCP transports.
 
 use std::io;
-#[cfg(windows)]
-use std::os::windows::io::OwnedHandle;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
@@ -45,12 +43,8 @@ pub(crate) struct LocalProcessTerminator {
 #[cfg(windows)]
 /// Exact Windows ownership token captured when the stdio server is spawned.
 ///
-/// A job owns the complete process tree. The process-handle variant is the
-/// fallback when a remote executor cannot provide a job object.
-pub(crate) enum LocalProcessTerminator {
-    Job(codex_utils_pty::JobObject),
-    Process(OwnedHandle),
-}
+/// A job owns the complete process tree and closes it atomically with this owner.
+pub(crate) struct LocalProcessTerminator(codex_utils_pty::JobObject);
 
 #[cfg(not(any(unix, windows)))]
 /// Placeholder on targets without local process-tree termination support.
@@ -105,6 +99,11 @@ enum StdioServerProcessKind {
 }
 
 impl LocalProcessTerminator {
+    #[cfg(windows)]
+    pub(crate) fn new(job: codex_utils_pty::JobObject) -> Self {
+        Self(job)
+    }
+
     #[cfg(not(windows))]
     pub(crate) fn new(process_group_id: u32) -> Self {
         #[cfg(unix)]
@@ -175,13 +174,7 @@ impl LocalProcessTerminator {
 
     #[cfg(windows)]
     async fn terminate(&self) -> io::Result<()> {
-        let result = match self {
-            Self::Job(job) => job.terminate(),
-            Self::Process(process_handle) => {
-                codex_utils_pty::JobObject::terminate_process_handle(process_handle)
-            }
-        };
-        result.map_err(io::Error::other)
+        self.0.terminate().map_err(io::Error::other)
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -213,13 +206,7 @@ impl LocalProcessTerminator {
     fn terminate_on_drop(&self) {
         #[cfg(windows)]
         {
-            let result = match self {
-                Self::Job(job) => job.terminate(),
-                Self::Process(process_handle) => {
-                    codex_utils_pty::JobObject::terminate_process_handle(process_handle)
-                }
-            };
-            if let Err(error) = result {
+            if let Err(error) = self.0.terminate() {
                 warn!("Failed to terminate Windows MCP process: {error}");
             }
         }
@@ -291,6 +278,23 @@ impl StdioServerProcessHandle {
         }
 
         self.inner.wait_for_cleanup(attempt, completion).await
+    }
+
+    /// Retries one failed cleanup attempt before reporting failure.
+    pub(crate) async fn terminate_with_retry(&self) -> io::Result<()> {
+        let first_error = match self.terminate().await {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        warn!("failed to terminate MCP stdio server process; retrying once: {first_error}");
+        self.terminate().await.map_err(|retry_error| {
+            io::Error::new(
+                retry_error.kind(),
+                format!(
+                    "MCP stdio server cleanup failed twice: first attempt: {first_error}; retry: {retry_error}"
+                ),
+            )
+        })
     }
 }
 
@@ -407,26 +411,39 @@ impl Drop for StdioServerProcessHandleInner {
             StdioServerProcessKind::Executor(process) => {
                 let process = Arc::clone(process);
                 let program_name = self.program_name.clone();
-                let Ok(handle) = tokio::runtime::Handle::try_current() else {
-                    warn!(
-                        "Could not schedule remote MCP server process termination on drop ({}): no Tokio runtime is available",
-                        self.program_name
-                    );
-                    return;
-                };
-
-                std::mem::drop(handle.spawn(async move {
+                let terminate = async move {
                     if let Err(error) = terminate_executor_process(&process, &program_name).await {
                         warn!(
                             "Failed to terminate remote MCP server process on drop ({program_name}): {error}"
                         );
                     }
-                }));
+                };
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    std::mem::drop(handle.spawn(terminate));
+                    return;
+                }
+
+                if let Err(error) = std::thread::Builder::new()
+                    .name("codex-mcp-executor-cleanup".to_string())
+                    .spawn(move || {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_time()
+                            .build();
+                        match runtime {
+                            Ok(runtime) => runtime.block_on(terminate),
+                            Err(error) => warn!(
+                                "Could not create runtime for remote MCP cleanup on drop: {error}"
+                            ),
+                        }
+                    })
+                {
+                    warn!("Could not start remote MCP cleanup thread on drop: {error}");
+                }
             }
         }
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 #[path = "stdio_server_process_tests.rs"]
 mod tests;

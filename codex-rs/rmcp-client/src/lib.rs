@@ -28,6 +28,12 @@ pub use auth_status::determine_streamable_http_auth_status;
 pub use auth_status::determine_streamable_http_auth_status_from_credentials;
 pub use auth_status::discover_streamable_http_oauth;
 pub use codex_protocol::protocol::McpAuthStatus;
+#[cfg(unix)]
+pub use codex_utils_pty::configured_mcp_process_supervisor_exe;
+#[cfg(not(unix))]
+pub fn configured_mcp_process_supervisor_exe() -> Option<std::path::PathBuf> {
+    None
+}
 pub use event_notification_transport::EventNotificationReceiver;
 pub use http_client_adapter::StreamableHttpRedirectMode;
 pub use http_headers::with_http_headers_helper;

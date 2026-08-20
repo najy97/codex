@@ -39,6 +39,42 @@ pub struct JobObject {
 }
 
 impl JobObject {
+    fn open_assignable_process(process_id: u32) -> io::Result<OwnedHandle> {
+        let process = unsafe {
+            OpenProcess(
+                PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_SUSPEND_RESUME,
+                /*bInheritHandle*/ 0,
+                process_id,
+            )
+        };
+        if process.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedHandle::from_raw_handle(process.cast()) })
+    }
+
+    fn resume_process(process: &OwnedHandle) -> io::Result<()> {
+        let status = unsafe { NtResumeProcess(process.as_raw_handle().cast()) };
+        if NT_SUCCESS(status) {
+            return Ok(());
+        }
+        let _ = Self::terminate_raw_process(process.as_raw_handle());
+        Err(io::Error::other(format!(
+            "failed to resume suspended process: NTSTATUS {status:#x}"
+        )))
+    }
+
+    fn terminate_raw_process(handle: RawHandle) -> io::Result<()> {
+        let terminated = unsafe {
+            TerminateProcess(handle.cast(), /*uExitCode*/ 1)
+        };
+        if terminated == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
     /// Creates a Job Object configured to terminate all members when its last handle closes.
     pub fn create() -> io::Result<Self> {
         let handle = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
@@ -79,14 +115,7 @@ impl JobObject {
 
     /// Terminates the exact process identified by a previously captured handle.
     pub fn terminate_process_handle(handle: &std::os::windows::io::OwnedHandle) -> io::Result<()> {
-        let terminated = unsafe {
-            TerminateProcess(handle.as_raw_handle().cast(), /*uExitCode*/ 1)
-        };
-        if terminated == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
+        Self::terminate_raw_process(handle.as_raw_handle())
     }
 
     fn set_limit_flags(handle: &OwnedHandle, flags: u32) -> io::Result<()> {
@@ -131,28 +160,9 @@ impl JobObject {
     /// Nested jobs can reject assignment. Such a child is resumed without
     /// containment so callers can preserve their existing compatibility fallback.
     pub fn assign_and_resume_process(&self, process_id: u32) -> io::Result<bool> {
-        let process = unsafe {
-            OpenProcess(
-                PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_SUSPEND_RESUME,
-                /*bInheritHandle*/ 0,
-                process_id,
-            )
-        };
-        if process.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        let process = unsafe { OwnedHandle::from_raw_handle(process.cast()) };
+        let process = Self::open_assignable_process(process_id)?;
         let assignment = self.assign_process(process.as_raw_handle());
-
-        let status = unsafe { NtResumeProcess(process.as_raw_handle().cast()) };
-        if !NT_SUCCESS(status) {
-            unsafe {
-                TerminateProcess(process.as_raw_handle().cast(), /*uExitCode*/ 1)
-            };
-            return Err(io::Error::other(format!(
-                "failed to resume suspended process: NTSTATUS {status:#x}"
-            )));
-        }
+        Self::resume_process(&process)?;
 
         match assignment {
             Ok(()) => Ok(true),
@@ -163,6 +173,16 @@ impl JobObject {
                 Ok(false)
             }
         }
+    }
+
+    /// Assigns and resumes a suspended child, terminating it if assignment fails.
+    pub fn assign_and_resume_process_strict(&self, process_id: u32) -> io::Result<()> {
+        let process = Self::open_assignable_process(process_id)?;
+        if let Err(error) = self.assign_process(process.as_raw_handle()) {
+            let _ = Self::terminate_raw_process(process.as_raw_handle());
+            return Err(error);
+        }
+        Self::resume_process(&process)
     }
 
     /// Starts a process only after assigning it to this Job Object.

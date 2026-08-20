@@ -301,6 +301,50 @@ async fn rejected_job_assignment_resumes_existing_job_member() -> anyhow::Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn strict_rejected_job_assignment_terminates_existing_job_member() -> anyhow::Result<()> {
+    let Some(python) = find_python() else {
+        eprintln!("python not found; skipping Windows strict nested-job test");
+        return Ok(());
+    };
+
+    let owning_job = crate::JobObject::create()?;
+    let rejected_job = crate::JobObject::create_without_breakaway()?;
+    let mut occupied_command = Command::new(&python);
+    occupied_command
+        .args(["-c", "import time; time.sleep(60)"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut existing_member = rejected_job.spawn_contained(&mut occupied_command)?;
+
+    let mut command = Command::new(&python);
+    command
+        .args(["-c", "import time; time.sleep(60)"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    rejected_job.prepare_suspended_spawn(&mut command);
+    let mut root = command.spawn()?;
+    let process_handle = root
+        .raw_handle()
+        .ok_or_else(|| anyhow::anyhow!("missing suspended process handle"))?;
+    owning_job.assign_process(process_handle)?;
+    let process_id = root
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("missing suspended process id"))?;
+
+    rejected_job
+        .assign_and_resume_process_strict(process_id)
+        .expect_err("strict assignment must reject and terminate an unrelated job member");
+    let status = tokio::time::timeout(Duration::from_secs(10), root.wait()).await??;
+    assert_eq!(status.code(), Some(1));
+
+    rejected_job.terminate()?;
+    tokio::time::timeout(Duration::from_secs(10), existing_member.wait()).await??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn conpty_delivers_input_to_foreground_children() -> anyhow::Result<()> {
     let Some(python) = find_python() else {
         eprintln!("python not found; skipping ConPTY input test");

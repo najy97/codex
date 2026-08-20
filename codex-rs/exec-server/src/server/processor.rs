@@ -481,6 +481,73 @@ mod tests {
             .expect("second processor should join");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detached_session_expiry_terminates_its_process_group() {
+        let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
+        let (mut writer, mut lines, task) = spawn_test_connection(registry, "detached-expiry");
+        send_request(
+            &mut writer,
+            /*id*/ 1,
+            INITIALIZE_METHOD,
+            &InitializeParams {
+                client_name: "exec-server-test".to_string(),
+                resume_session_id: None,
+            },
+        )
+        .await;
+        let _: InitializeResponse = read_response(&mut lines, /*expected_id*/ 1).await;
+        send_notification(&mut writer, INITIALIZED_METHOD, &()).await;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp_dir.path().join("detached-process.pid");
+        let mut params = exec_params(ProcessId::from("detached-process"));
+        params.argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo $$ > \"$PID_FILE\"; trap '' TERM; while :; do sleep 1; done".to_string(),
+        ];
+        params.env.insert(
+            "PID_FILE".to_string(),
+            pid_file.to_string_lossy().into_owned(),
+        );
+        send_request(&mut writer, /*id*/ 2, EXEC_METHOD, &params).await;
+        let _: ExecResponse = read_response(&mut lines, /*expected_id*/ 2).await;
+        let process_id = loop {
+            match std::fs::read_to_string(&pid_file) {
+                Ok(pid) => break pid.trim().parse::<u32>().expect("process pid"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("failed to read process pid: {error}"),
+            }
+        };
+
+        drop(writer);
+        drop(lines);
+        timeout(Duration::from_secs(1), task)
+            .await
+            .expect("processor should exit")
+            .expect("processor should join");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &process_id.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if !alive {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "detached exec-server process survived session expiry"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     fn spawn_test_connection(
         registry: Arc<SessionRegistry>,
         label: &str,

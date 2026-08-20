@@ -960,6 +960,34 @@ async fn remove_sync_barrier_if_current(barrier_id: &str, barrier: &Arc<Barrier>
     }
 }
 
+#[cfg(unix)]
+async fn run_supervisor_parent_harness() -> Result<(), Box<dyn std::error::Error>> {
+    let current_exe = std::env::current_exe()?;
+    let pid_file = std::env::var_os("MCP_TEST_PID_FILE")
+        .ok_or("MCP supervisor parent harness requires MCP_TEST_PID_FILE")?;
+    let client = codex_rmcp_client::RmcpClient::new_stdio_client(
+        current_exe.clone().into_os_string(),
+        Vec::new(),
+        Some(std::collections::HashMap::from([
+            (std::ffi::OsString::from("MCP_TEST_PID_FILE"), pid_file),
+            (
+                std::ffi::OsString::from("MCP_TEST_TERM_RESISTANT_ROLE"),
+                std::ffi::OsString::from("1"),
+            ),
+        ])),
+        &[],
+        /*cwd*/ None,
+        Arc::new(
+            codex_rmcp_client::LocalStdioServerLauncher::new(std::env::current_dir()?)
+                .with_process_supervisor(Some(current_exe)),
+        ),
+    )
+    .await?;
+    std::future::pending::<()>().await;
+    drop(client);
+    Ok(())
+}
+
 fn parse_data_url(url: &str) -> Option<(String, String)> {
     let rest = url.strip_prefix("data:")?;
     let (mime_and_opts, data) = rest.split_once(',')?;
@@ -969,6 +997,32 @@ fn parse_data_url(url: &str) -> Option<(String, String)> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(
+            codex_utils_pty::CODEX_MCP_PROCESS_SUPERVISOR_ARG1,
+        ))
+    {
+        codex_utils_pty::run_mcp_process_supervisor_main();
+    }
+
+    #[cfg(unix)]
+    if std::env::var_os("MCP_TEST_SUPERVISOR_PARENT_ROLE").is_some() {
+        return run_supervisor_parent_harness().await;
+    }
+
+    #[cfg(unix)]
+    if std::env::var_os("MCP_TEST_TERM_RESISTANT_ROLE").is_some() {
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        }
+        let pid_file = std::env::var_os("MCP_TEST_PID_FILE")
+            .ok_or("TERM-resistant test process requires MCP_TEST_PID_FILE")?;
+        std::fs::write(pid_file, std::process::id().to_string())?;
+        std::future::pending::<()>().await;
+        return Ok(());
+    }
+
     #[cfg(windows)]
     if std::env::var_os("MCP_TEST_DESCENDANT_ROLE").is_some() {
         tokio::time::sleep(Duration::from_secs(30)).await;

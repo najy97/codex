@@ -950,20 +950,28 @@ impl RmcpClient {
         }
     }
 
-    /// Stop the MCP transport and any stdio server process owned by this client.
-    pub async fn shutdown(&self) {
+    /// Stop the MCP transport and confirm termination of any owned stdio process.
+    pub async fn try_shutdown(&self) -> io::Result<()> {
         let previous_state = {
             let mut guard = self.state.lock().await;
             std::mem::replace(&mut *guard, ClientState::Closed)
         };
 
-        if let Some(process) = &self.stdio_process
-            && let Err(error) = process.terminate().await
-        {
-            warn!("failed to terminate MCP stdio server process: {error}");
-        }
+        let cleanup_result = if let Some(process) = &self.stdio_process {
+            process.terminate_with_retry().await
+        } else {
+            Ok(())
+        };
 
         drop(previous_state);
+        cleanup_result
+    }
+
+    /// Stop the MCP transport and log any stdio process cleanup failure.
+    pub async fn shutdown(&self) {
+        if let Err(error) = self.try_shutdown().await {
+            warn!("failed to terminate MCP stdio server process: {error}");
+        }
     }
 
     /// This should be called after every tool call so that if a given tool call triggered

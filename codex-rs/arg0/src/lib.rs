@@ -104,6 +104,10 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
     if argv1 == CODEX_ARG0_EXEC_HELPER_ARG1 {
         codex_exec_server::run_arg0_exec_helper_main();
     }
+    #[cfg(unix)]
+    if argv1 == codex_utils_pty::CODEX_MCP_PROCESS_SUPERVISOR_ARG1 {
+        codex_utils_pty::run_mcp_process_supervisor_main();
+    }
     if argv1 == CODEX_FS_HELPER_ARG1 {
         codex_exec_server::run_fs_helper_main();
     }
@@ -226,6 +230,10 @@ where
     // would be nice to avoid leaving temporary directories behind, if possible.
     let path_entry_guard = arg0_dispatch();
     let current_exe = std::env::current_exe().ok();
+    #[cfg(unix)]
+    if let Some(current_exe) = &current_exe {
+        codex_utils_pty::configure_mcp_process_supervisor_exe(current_exe.clone());
+    }
 
     // Regular invocation. Run the async entry point on a thread with the same
     // stack budget as Tokio workers; `Runtime::block_on` otherwise runs the

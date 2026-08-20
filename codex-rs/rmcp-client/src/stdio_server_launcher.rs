@@ -124,7 +124,7 @@ impl Transport<RoleClient> for StdioServerTransport {
     }
 
     async fn close(&mut self) -> std::result::Result<(), Self::Error> {
-        self.process.terminate().await?;
+        self.process.terminate_with_retry().await?;
         match &mut self.inner {
             StdioServerTransportInner::LocalLegacy(transport) => transport.close().await,
             StdioServerTransportInner::LocalModern(transport) => transport.close().await,
@@ -171,6 +171,7 @@ impl StdioServerCommand {
 #[derive(Clone)]
 pub struct LocalStdioServerLauncher {
     fallback_cwd: PathBuf,
+    process_supervisor_exe: Option<PathBuf>,
 }
 
 impl LocalStdioServerLauncher {
@@ -179,7 +180,16 @@ impl LocalStdioServerLauncher {
     /// `fallback_cwd` is used when the MCP server config omits `cwd`, so
     /// relative commands resolve from the caller's runtime working directory.
     pub fn new(fallback_cwd: PathBuf) -> Self {
-        Self { fallback_cwd }
+        Self {
+            fallback_cwd,
+            process_supervisor_exe: None,
+        }
+    }
+
+    /// Uses a Codex arg-dispatch executable to supervise Unix MCP processes.
+    pub fn with_process_supervisor(mut self, process_supervisor_exe: Option<PathBuf>) -> Self {
+        self.process_supervisor_exe = process_supervisor_exe;
+        self
     }
 }
 
@@ -189,12 +199,15 @@ impl StdioServerLauncher for LocalStdioServerLauncher {
         command: StdioServerCommand,
     ) -> BoxFuture<'static, io::Result<StdioServerTransport>> {
         let fallback_cwd = self.fallback_cwd.clone();
+        let process_supervisor_exe = self.process_supervisor_exe.clone();
         async move {
             // Keep synchronous program resolution and process creation from blocking the
             // caller's startup deadline.
-            tokio::task::spawn_blocking(move || Self::launch_server(command, fallback_cwd))
-                .await
-                .map_err(io::Error::other)?
+            tokio::task::spawn_blocking(move || {
+                Self::launch_server(command, fallback_cwd, process_supervisor_exe)
+            })
+            .await
+            .map_err(io::Error::other)?
         }
         .boxed()
     }
@@ -212,6 +225,7 @@ impl LocalStdioServerLauncher {
     fn launch_server(
         command: StdioServerCommand,
         fallback_cwd: PathBuf,
+        process_supervisor_exe: Option<PathBuf>,
     ) -> io::Result<StdioServerTransport> {
         let StdioServerCommand {
             program,
@@ -228,6 +242,17 @@ impl LocalStdioServerLauncher {
             program_resolver::resolve(program, &envs, &cwd).map_err(io::Error::other)?;
 
         let build_command = || {
+            #[cfg(unix)]
+            let mut command = if let Some(process_supervisor_exe) = &process_supervisor_exe {
+                let mut command = Command::new(process_supervisor_exe);
+                command
+                    .arg(codex_utils_pty::CODEX_MCP_PROCESS_SUPERVISOR_ARG1)
+                    .arg(&resolved_program);
+                command
+            } else {
+                Command::new(&resolved_program)
+            };
+            #[cfg(not(unix))]
             let mut command = Command::new(&resolved_program);
             command
                 .kill_on_drop(true)
@@ -246,16 +271,14 @@ impl LocalStdioServerLauncher {
         #[cfg(not(windows))]
         let command = build_command();
         #[cfg(windows)]
-        let job = match codex_utils_pty::JobObject::create_without_breakaway() {
-            Ok(job) => {
-                job.prepare_suspended_spawn(&mut command);
-                Some(job)
-            }
-            Err(error) => {
-                warn!("Windows MCP process job containment unavailable: {error}");
-                None
-            }
-        };
+        let job = codex_utils_pty::JobObject::create_without_breakaway().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("Windows MCP process job containment unavailable: {error}"),
+            )
+        })?;
+        #[cfg(windows)]
+        job.prepare_suspended_spawn(&mut command);
 
         let spawn_transport = |command: Command| -> io::Result<(
             StdioServerTransportInner,
@@ -288,39 +311,22 @@ impl LocalStdioServerLauncher {
         };
         let (transport, stderr, process_id) = spawn_transport(command)?;
         #[cfg(windows)]
-        let (transport, stderr, process_id, job) = match job {
-            Some(job) => match process_id
-                .ok_or_else(|| io::Error::other("missing suspended MCP server process id"))
-                .and_then(|process_id| job.assign_and_resume_process(process_id))
-            {
-                Ok(true) => (transport, stderr, process_id, Some(job)),
-                Ok(false) => (transport, stderr, process_id, None),
-                Err(error) => {
-                    warn!(
-                        "Windows MCP process job containment failed; retrying without it: {error}"
-                    );
-                    drop(stderr);
-                    drop(transport);
-                    drop(job);
-                    let (transport, stderr, process_id) = spawn_transport(build_command())?;
-                    (transport, stderr, process_id, None)
-                }
-            },
-            None => (transport, stderr, process_id, None),
+        let job = {
+            let process_id = process_id
+                .ok_or_else(|| io::Error::other("missing suspended MCP server process id"))?;
+            if let Err(error) = job.assign_and_resume_process_strict(process_id) {
+                drop(stderr);
+                drop(transport);
+                drop(job);
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("Windows MCP process job containment failed: {error}"),
+                ));
+            }
+            job
         };
         #[cfg(windows)]
-        let terminator = match job {
-            Some(job) => Some(LocalProcessTerminator::Job(job)),
-            None => process_id.and_then(|process_id| {
-                match codex_utils_pty::JobObject::open_process_handle(process_id) {
-                    Ok(handle) => Some(LocalProcessTerminator::Process(handle)),
-                    Err(error) => {
-                        warn!("Windows MCP process handle unavailable: {error}");
-                        None
-                    }
-                }
-            }),
-        };
+        let terminator = Some(LocalProcessTerminator::new(job));
         #[cfg(not(windows))]
         let terminator = process_id.map(LocalProcessTerminator::new);
         let process = StdioServerProcessHandle::local(program_name.clone(), terminator);

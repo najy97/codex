@@ -80,6 +80,75 @@ async fn wait_for_process_exit(pid: u32) -> Result<()> {
     anyhow::bail!("process {pid} still running after timeout");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervisor_reaps_term_resistant_server_after_parent_sigkill() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let server_pid_file = temp_dir.path().join("supervised-server.pid");
+    let mut unowned = tokio::process::Command::new("/bin/sleep")
+        .arg("300")
+        .spawn()?;
+    let unowned_pid = unowned.id().context("unowned process should have a pid")?;
+    let mut parent = tokio::process::Command::new(stdio_server_bin()?)
+        .env("MCP_TEST_SUPERVISOR_PARENT_ROLE", "1")
+        .env("MCP_TEST_PID_FILE", &server_pid_file)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let parent_pid = parent.id().context("supervisor parent should have a pid")?;
+    let server_pid = wait_for_pid_file(&server_pid_file).await?;
+    assert!(process_exists(server_pid));
+
+    let killed = std::process::Command::new("kill")
+        .args(["-KILL", &parent_pid.to_string()])
+        .status()?;
+    assert!(killed.success(), "failed to SIGKILL supervisor parent");
+    let _ = tokio::time::timeout(Duration::from_secs(5), parent.wait()).await??;
+    wait_for_process_exit(server_pid).await?;
+    assert!(
+        process_exists(unowned_pid),
+        "supervisor cleanup must preserve an unowned process group"
+    );
+
+    unowned.kill().await?;
+    let _ = unowned.wait().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervised_stdio_server_initializes_and_shuts_down() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let server_pid_file = temp_dir.path().join("supervised-initialize.pid");
+    let server_bin = stdio_server_bin()?;
+    let client = RmcpClient::new_stdio_client(
+        server_bin.clone().into_os_string(),
+        Vec::new(),
+        Some(HashMap::from([(
+            OsString::from("MCP_TEST_PID_FILE"),
+            OsString::from(server_pid_file.as_os_str()),
+        )])),
+        &[],
+        /*cwd*/ None,
+        Arc::new(
+            LocalStdioServerLauncher::new(std::env::current_dir()?)
+                .with_process_supervisor(Some(server_bin)),
+        ),
+    )
+    .await?;
+    client
+        .initialize(
+            init_params(),
+            Some(Duration::from_secs(5)),
+            Box::new(|_, _| async { unreachable!("test does not elicit") }.boxed()),
+        )
+        .await?;
+    let server_pid = wait_for_pid_file(&server_pid_file).await?;
+
+    client.try_shutdown().await?;
+
+    wait_for_process_exit(server_pid).await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn drop_kills_wrapper_process_group() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
